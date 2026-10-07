@@ -2,11 +2,12 @@
 
 import { useEffect, useState } from "react";
 import type { Brief } from "@/lib/brief";
+import type { SentRecord } from "@/lib/brief/history";
 
 type State =
   | { status: "loading" }
   | { status: "error"; message: string }
-  | { status: "ready"; brief: Brief };
+  | { status: "ready"; records: SentRecord[] };
 
 type MailState =
   | { status: "idle" }
@@ -21,11 +22,13 @@ const ERROR_LABELS: Record<string, string> = {
   summary: "AI 統整",
 };
 
-// API 在 AI 統整失敗時回 502，但仍帶有其他資料，所以不看 res.ok
-async function loadBrief(): Promise<State> {
+// 從資料庫讀取寄信紀錄
+async function loadRecords(): Promise<State> {
   try {
-    const res = await fetch("/api/daily-brief");
-    return { status: "ready", brief: (await res.json()) as Brief };
+    const res = await fetch("/api/sent-briefs", { cache: "no-store" });
+    const data = await res.json();
+    if (!res.ok) return { status: "error", message: data.error };
+    return { status: "ready", records: data.items as SentRecord[] };
   } catch (error) {
     return {
       status: "error",
@@ -34,13 +37,10 @@ async function loadBrief(): Promise<State> {
   }
 }
 
-async function sendEmail(brief: Brief): Promise<MailState> {
+// 不帶內容，由伺服器產生最新的簡報後寄出並存檔
+async function sendEmail(): Promise<MailState> {
   try {
-    const res = await fetch("/api/send-email", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(brief),
-    });
+    const res = await fetch("/api/send-email", { method: "POST" });
     const data = await res.json();
     if (!res.ok) return { status: "error", message: data.error };
     return { status: "sent", to: data.to, saveError: data.saveError };
@@ -236,10 +236,12 @@ function NewsCard({ brief }: { brief: Brief }) {
 
 export default function DailyBrief() {
   const [state, setState] = useState<State>({ status: "loading" });
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [mail, setMail] = useState<MailState>({ status: "idle" });
 
   useEffect(() => {
     let ignore = false;
-    loadBrief().then((next) => {
+    loadRecords().then((next) => {
       if (!ignore) setState(next);
     });
     return () => {
@@ -247,22 +249,26 @@ export default function DailyBrief() {
     };
   }, []);
 
-  const [mail, setMail] = useState<MailState>({ status: "idle" });
-
   const reload = () => {
     setState({ status: "loading" });
     setMail({ status: "idle" });
-    loadBrief().then(setState);
+    loadRecords().then(setState);
   };
 
-  const brief = state.status === "ready" ? state.brief : null;
-
-  const send = () => {
-    if (!brief) return;
+  // 寄完後重新讀取紀錄，並切回最新的一筆
+  const send = async () => {
     setMail({ status: "sending" });
-    sendEmail(brief).then(setMail);
+    const result = await sendEmail();
+    setMail(result);
+    if (result.status === "sent") {
+      setSelectedId(null);
+      setState(await loadRecords());
+    }
   };
 
+  const records = state.status === "ready" ? state.records : [];
+  const selected = records.find((r) => r.id === selectedId) ?? records[0];
+  const brief = selected?.brief;
   const errors = brief ? Object.entries(brief.errors) : [];
 
   return (
@@ -270,11 +276,10 @@ export default function DailyBrief() {
       <header className="flex items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">AI 每日簡報</h1>
-          {brief && (
-            <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
-              {brief.date}
-            </p>
-          )}
+          <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
+            寄信紀錄
+            {state.status === "ready" && `・共 ${records.length} 筆`}
+          </p>
         </div>
         <div className="flex shrink-0 gap-2">
           <button
@@ -288,14 +293,22 @@ export default function DailyBrief() {
           <button
             type="button"
             onClick={send}
-            disabled={!brief || mail.status === "sending"}
+            disabled={mail.status === "sending"}
             className="h-10 rounded-full bg-foreground px-4 text-sm font-medium text-background transition-colors hover:bg-[#383838] disabled:opacity-50 dark:hover:bg-[#ccc]"
           >
-            {mail.status === "sending" ? "寄送中…" : "寄到信箱"}
+            {mail.status === "sending" ? "寄送中…" : "立即寄一封"}
           </button>
         </div>
       </header>
 
+      {mail.status === "sending" && (
+        <p
+          role="status"
+          className="rounded-2xl border border-black/[.08] px-6 py-4 text-sm text-zinc-600 dark:border-white/[.145] dark:text-zinc-300"
+        >
+          正在產生今天的簡報並寄出，大約需要 10 秒…
+        </p>
+      )}
       {mail.status === "sent" && (
         <p
           role="status"
@@ -324,7 +337,7 @@ export default function DailyBrief() {
 
       {state.status === "loading" && (
         <p className="py-16 text-center text-zinc-500 dark:text-zinc-400">
-          正在整理今天的簡報，大約需要 10 秒…
+          正在讀取寄信紀錄…
         </p>
       )}
 
@@ -334,8 +347,43 @@ export default function DailyBrief() {
         </p>
       )}
 
-      {brief && (
+      {state.status === "ready" && records.length === 0 && (
+        <p className="py-16 text-center text-zinc-500 dark:text-zinc-400">
+          還沒有寄信紀錄，按「立即寄一封」試試看。
+        </p>
+      )}
+
+      {selected && brief && (
         <>
+          <nav aria-label="寄信紀錄" className="flex flex-wrap gap-2">
+            {records.map((record) => (
+              <button
+                key={record.id}
+                type="button"
+                onClick={() => setSelectedId(record.id)}
+                aria-pressed={record.id === selected.id}
+                className={`h-9 rounded-full border px-3 text-sm tabular-nums transition-colors ${
+                  record.id === selected.id
+                    ? "border-transparent bg-foreground text-background"
+                    : "border-black/[.08] hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-white/[.08]"
+                }`}
+              >
+                {formatTime(record.sentAt)}
+              </button>
+            ))}
+          </nav>
+
+          <Card title="信件資訊">
+            <dl className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <Stat label="寄出時間" value={formatTime(selected.sentAt)} />
+              <Stat label="簡報日期" value={brief.date} />
+              <Stat label="主旨" value={selected.email.subject} />
+              <Stat label="收件人" value={selected.email.to} />
+              <Stat label="寄件人" value={selected.email.from} />
+              <Stat label="Resend ID" value={selected.email.resendId} />
+            </dl>
+          </Card>
+
           {errors.length > 0 && (
             <ul className="rounded-2xl border border-red-500/30 bg-red-500/10 p-6 text-sm text-red-700 dark:text-red-300">
               {errors.map(([key, reason]) => (
